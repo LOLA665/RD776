@@ -1,0 +1,106 @@
+name: Paperspace GPU VM + Tailscale -> show IP/user/pass
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp-vm:
+    runs-on: ubuntu-latest
+    env:
+      PAPERSPACE_API_KEY: ${{ secrets.PAPERSPACE_API_KEY }}
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl openssl
+
+      - name: Set TEMPLATE_DEFAULT
+        run: |
+          echo "TEMPLATE_DEFAULT=a1b2c3d4-5678-90ef-ghij-1234567890ab" >> $GITHUB_ENV
+
+      - name: Generate random RDP credentials
+        id: creds
+        run: |
+          USER="rdpuser$(date +%s | sha256sum | head -c6)"
+          PASS=$(openssl rand -base64 15 | tr -dc 'A-Za-z0-9' | head -c18)
+          echo "ADMIN_USER=$USER" >> $GITHUB_ENV
+          echo "ADMIN_PASS=$PASS" >> $GITHUB_ENV
+          echo "Generated RDP credentials: $USER / $PASS"
+
+      - name: Create Paperspace machine (Windows GPU default)
+        id: create
+        run: |
+          NAME="github-rdp-$(date +%s)"
+          CREATE_PAYLOAD=$(jq -n --arg region "East Coast (NY2)" --arg mtype "GPU+" --arg size "500" --arg billing "hourly" --arg tmpl "$TEMPLATE_DEFAULT" --arg name "$NAME" '{
+            region: $region,
+            machineType: $mtype,
+            size: $size,
+            billingType: $billing,
+            templateId: $tmpl,
+            name: $name
+          }')
+          RESPONSE=$(curl -s -X POST -H "Authorization: Bearer $PAPERSPACE_API_KEY" -H "Content-Type: application/json" -d "$CREATE_PAYLOAD" https://api.paperspace.io/machines/create || true)
+          echo "Raw response: $RESPONSE"
+          MACHINE_ID=$(echo "$RESPONSE" | jq -r '.id // .machineId // .machine_id // empty' 2>/dev/null || echo "")
+          if [ -z "$MACHINE_ID" ]; then
+            echo "ERROR: VM nu a fost creat. Vezi raw response de mai sus."
+            exit 1
+          fi
+          echo "MACHINE_ID=$MACHINE_ID" >> $GITHUB_ENV
+          echo "Created machine $MACHINE_ID"
+
+      - name: Wait for machine to boot
+        run: sleep 90
+
+      - name: Install Tailscale and set RDP user
+        id: setup
+        run: |
+          PS_SCRIPT="powershell -NoProfile -ExecutionPolicy Bypass -Command \
+            net user ${{ env.ADMIN_USER }} ${{ env.ADMIN_PASS }} /add; \
+            net localgroup 'Remote Desktop Users' ${{ env.ADMIN_USER }} /add; \
+            Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi -OutFile C:\\tailscale_setup.msi -UseBasicParsing; \
+            Start-Process msiexec.exe -ArgumentList '/i','C:\\tailscale_setup.msi','/qn' -Wait; \
+            & 'C:\\Program Files\\Tailscale IPN\\tailscale.exe' up --authkey='${{ secrets.TAILSCALE_AUTHKEY }}' --accept-routes --accept-dns; \
+            Start-Sleep -Seconds 8; \
+            $ip = (& 'C:\\Program Files\\Tailscale IPN\\tailscale.exe' ip -4) -join ''; \
+            Write-Output \"TAILSCALE_IP=$ip`nRDP_USER=${{ env.ADMIN_USER }}`nRDP_PASS=${{ env.ADMIN_PASS }}\"; \
+            \"$ip|${{ env.ADMIN_USER }}|${{ env.ADMIN_PASS }}\" | Out-File C:\\tailscale_info.txt -Encoding utf8"
+
+          CMD_PAYLOAD=$(jq -n --arg cmd "$PS_SCRIPT" '{ command: $cmd }')
+          RESP=$(curl -s -X POST -H "Authorization: Bearer $PAPERSPACE_API_KEY" -H "Content-Type: application/json" -d "$CMD_PAYLOAD" "https://api.paperspace.io/machines/${{ env.MACHINE_ID }}/command")
+          CMD_ID=$(echo "$RESP" | jq -r '.id // .commandId // .command_id // empty')
+          echo "COMMAND_ID=$CMD_ID" >> $GITHUB_ENV
+
+      - name: Poll command output & show credentials
+        run: |
+          ATTEMPTS=0
+          FINAL=""
+          while [ $ATTEMPTS -lt 40 ]; do
+            sleep 6
+            ATTEMPTS=$((ATTEMPTS+1))
+            RESP=$(curl -s -H "Authorization: Bearer $PAPERSPACE_API_KEY" "https://api.paperspace.io/machines/${{ env.MACHINE_ID }}/commands/${{ env.COMMAND_ID }}")
+            OUT=$(echo "$RESP" | jq -r '.response // .output // .stdout // empty')
+            STATUS=$(echo "$RESP" | jq -r '.status // .state // empty')
+            EXITCODE=$(echo "$RESP" | jq -r '.exitCode // .returnCode // empty')
+            if [ -n "$OUT" ] && [ "$OUT" != "null" ]; then FINAL="$OUT"; fi
+            if [ -n "$EXITCODE" ] && [ "$EXITCODE" != "null" ]; then break; fi
+            if [ "$STATUS" = "completed" ] || [ "$STATUS" = "finished" ] || [ "$STATUS" = "done" ]; then break; fi
+          done
+          echo "---- FINAL OUTPUT ----"
+          echo "$FINAL"
+          IP=$(echo "$FINAL" | grep -Eo 'TAILSCALE_IP=.*' | sed 's/TAILSCALE_IP=//')
+          USER=$(echo "$FINAL" | grep -Eo 'RDP_USER=.*' | sed 's/RDP_USER=//')
+          PASS=$(echo "$FINAL" | grep -Eo 'RDP_PASS=.*' | sed 's/RDP_PASS=//')
+          echo ">>> Tailscale IP: $IP"
+          echo ">>> RDP user: $USER"
+          echo ">>> RDP pass: $PASS"
+
+      - name: Keep VM alive for 6 hours
+        run: sleep 21600
+
+      - name: Stop the Paperspace machine
+        if: always()
+        run: |
+          curl -s -X POST -H "Authorization: Bearer $PAPERSPACE_API_KEY" "https://api.paperspace.io/machines/${{ env.MACHINE_ID }}/stop"
+          
