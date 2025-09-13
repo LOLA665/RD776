@@ -1,0 +1,117 @@
+name: Random IP + Tailscale + Random User
+
+on:
+  workflow_dispatch:
+
+jobs:
+  random-info:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Update & install dependencies
+        run: |
+          sudo apt update -y
+          sudo apt install -y curl python3
+
+      - name: Install Tailscale (optional)
+        run: |
+          # Install tailscale daemon
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscaled & sleep 3
+      - name: Generate username & password
+        id: gencreds
+        run: |
+          # username: ransom + 6 random alnum chars
+          RANDUSER="ransom$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c6)"
+          # password: 16 chars base64-like
+          RANDPASS=$(tr -dc 'A-Za-z0-9!@#$%_-+=' </dev/urandom | head -c16)
+          echo "USERNAME=$RANDUSER" >> $GITHUB_ENV
+          echo "PASSWORD=$RANDPASS" >> $GITHUB_ENV
+          echo "::set-output name=username::$RANDUSER"
+          echo "::set-output name=password::$RANDPASS"
+
+      - name: Start Tailscale (if auth key provided)
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY || '' }}
+        run: |
+          if [ -n "$TAILSCALE_AUTHKEY" ]; then
+            sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --accept-routes --accept-dns=false || true
+            sleep 3
+            # try to get a tailscale IP if assigned
+            TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || true)
+            echo "TS_IP=${TAILSCALE_IP:-<none>}" >> $GITHUB_ENV
+          else
+            echo "TS_IP=<no-authkey>" >> $GITHUB_ENV
+          fi
+
+      - name: Generate random public-ish IPv4
+        id: genip
+        run: |
+          python3 - <<'PY'
+import random,sys
+def valid_octet(o): return 1<=o<=223 and o!=127
+while True:
+    o1=random.randint(1,223)
+    o2=random.randint(0,255)
+    o3=random.randint(0,255)
+    o4=random.randint(1,254)
+    # skip private/reserved
+    if o1==10: continue
+    if o1==127: continue
+    if o1==169 and o2==254: continue
+    if o1==172 and 16<=o2<=31: continue
+    if o1==192 and o2==168: continue
+    if o1>=224: continue
+    ip=f"{o1}.{o2}.{o3}.{o4}"
+    print(ip)
+    sys.exit(0)
+PY
+        shell: bash
+        # capture generated ip to env
+        continue-on-error: false
+
+      - name: Capture generated IP to env
+        run: |
+          # previous python printed IP to stdout, capture it:
+          GEN_IP=$(python3 - <<'PY'
+import random,sys
+def valid_octet(o): return 1<=o<=223 and o!=127
+while True:
+    o1=random.randint(1,223)
+    o2=random.randint(0,255)
+    o3=random.randint(0,255)
+    o4=random.randint(1,254)
+    if o1==10: continue
+    if o1==127: continue
+    if o1==169 and o2==254: continue
+    if o1==172 and 16<=o2<=31: continue
+    if o1==192 and o2==168: continue
+    if o1>=224: continue
+    print(f"{o1}.{o2}.{o3}.{o4}")
+    break
+PY
+)
+          echo "RANDOM_IP=$GEN_IP" >> $GITHUB_ENV
+          echo "RANDOM_IP=$GEN_IP"
+
+      - name: GPU check
+        run: |
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "GPU_PRESENT=true" >> $GITHUB_ENV
+            nvidia-smi || true
+          else
+            echo "GPU_PRESENT=false" >> $GITHUB_ENV
+            echo "No GPU detected on runner (no nvidia-smi)."
+          fi
+
+      - name: Show final info
+        run: |
+          echo "==========================================="
+          echo "📡 RANDOM VM REPORT (simulated runner)"
+          echo "Random IP      : $RANDOM_IP"
+          echo "Generated user : $USERNAME"
+          echo "Generated pass : $PASSWORD"
+          echo "Tailscale IP   : ${TS_IP:-<not-set>}"
+          echo "GPU present    : ${GPU_PRESENT:-<unknown>}"
+          echo "==========================================="
+          
