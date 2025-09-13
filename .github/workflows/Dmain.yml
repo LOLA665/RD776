@@ -1,0 +1,34 @@
+name: Windows 11 RDP with Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Set password for runner
+        run: |
+          net user runneradmin "P@ssw0rd123" /add
+          net localgroup Administrators runneradmin /add
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+      
+      - name: Install Tailscale
+        run: |
+          Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe -OutFile tailscale-setup.exe
+          Start-Process .\tailscale-setup.exe /quiet /norestart -Wait
+          & "C:\Program Files (x86)\Tailscale IPN\tailscale.exe" up --authkey %TAILSCALE_AUTHKEY%
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Show connection details
+        run: |
+          $ip = (Invoke-RestMethod -Uri "https://api.ipify.org?format=json").ip
+          Write-Output "===================================="
+          Write-Output "RDP Server is ready"
+          Write-Output "IP: $ip"
+          Write-Output "Username: runneradmin"
+          Write-Output "Password: P@ssw0rd123"
+          Write-Output "===================================="
+          
