@@ -1,0 +1,82 @@
+name: Random IP + Tailscale + Random User
+
+on:
+  workflow_dispatch:
+
+jobs:
+  random-info:
+    runs-on: ubuntu-latest
+    outputs:
+      RANDOM_IP: ${{ steps.gencreds.outputs.random_ip }}
+      USERNAME: ${{ steps.gencreds.outputs.username }}
+      PASSWORD: ${{ steps.gencreds.outputs.password }}
+      TS_IP: ${{ steps.tailscale.outputs.ts_ip }}
+      GPU_PRESENT: ${{ steps.gpu.outputs.gpu_present }}
+
+    steps:
+      - name: Update & install dependencies
+        run: |
+          sudo apt update -y
+          sudo apt install -y curl python3
+
+      - name: Install Tailscale (optional)
+        id: tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY || '' }}
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscaled & sleep 3
+          if [ -n "$TAILSCALE_AUTHKEY" ]; then
+            sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --accept-routes --accept-dns=false || true
+            sleep 3
+            TS_IP=$(tailscale ip -4 2>/dev/null || echo "<none>")
+          else
+            TS_IP="<no-authkey>"
+          fi
+          echo "ts_ip=$TS_IP" >> $GITHUB_OUTPUT
+
+      - name: Generate random username, password & IP
+        id: gencreds
+        run: |
+          # username: ransom + 6 random alnum chars
+          RANDUSER="ransom$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c6)"
+          # password: 16 chars random
+          RANDPASS=$(tr -dc 'A-Za-z0-9!@#$%_-+=' </dev/urandom | head -c16)
+          # random IPv4 public-ish
+          RANDIP=$(python3 - <<'PY'
+import random
+while True:
+    o1 = random.randint(1,223)
+    o2 = random.randint(0,255)
+    o3 = random.randint(0,255)
+    o4 = random.randint(1,254)
+    if o1==10 or o1==127: continue
+    if o1==169 and o2==254: continue
+    if o1==172 and 16<=o2<=31: continue
+    if o1==192 and o2==168: continue
+    if o1>=224: continue
+    print(f"{o1}.{o2}.{o3}.{o4}")
+    break
+PY
+)
+          echo "username=$RANDUSER" >> $GITHUB_OUTPUT
+          echo "password=$RANDPASS" >> $GITHUB_OUTPUT
+          echo "random_ip=$RANDIP" >> $GITHUB_OUTPUT
+
+      - name: GPU check
+        id: gpu
+        run: |
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            GPU_PRESENT=true
+          else
+            GPU_PRESENT=false
+          fi
+          echo "gpu_present=$GPU_PRESENT" >> $GITHUB_OUTPUT
+
+      - name: Show final info
+        run: |
+          echo "==========================================="
+          echo "📡 RANDOM VM REPORT (simulated runner)"
+          echo "Random IP      : ${{ steps.gencreds.outputs.random_ip }}"
+          echo "Generated user : ${{ steps.gencreds.
+          
