@@ -1,0 +1,91 @@
+name: Windows11 VM Setup with GPU + Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-vm:
+    runs-on: self-hosted
+    steps:
+      - name: Install & setup Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          VM_USER_NAME: ${{ secrets.VM_USER_NAME || '' }}
+          VM_PASSWORD: ${{ secrets.VM_PASSWORD || '' }}
+        run: |
+          if (-not $env:TAILSCALE_AUTHKEY) {
+            Write-Error "❌ TAILSCALE_AUTHKEY secret is required!"
+            exit 1
+          }
+
+          # --- User setup (optional) ---
+          $userName = if ($env:VM_USER_NAME -and $env:VM_USER_NAME.Trim() -ne '') { $env:VM_USER_NAME.Trim() } else { "vmuser" }
+          $pwdPlain = if ($env:VM_PASSWORD -and $env:VM_PASSWORD.Trim() -ne '') { $env:VM_PASSWORD } else {
+            Add-Type -AssemblyName System.Web
+            [System.Web.Security.Membership]::GeneratePassword(16,3)
+          }
+
+          try {
+            $existing = Get-LocalUser -Name $userName -ErrorAction Stop
+            Write-Host "ℹ️ User '$userName' already exists."
+          } catch {
+            Write-Host "➕ Creating user '$userName'..."
+            $securePwd = ConvertTo-SecureString $pwdPlain -AsPlainText -Force
+            New-LocalUser -Name $userName -Password $securePwd -FullName $userName -PasswordNeverExpires:$true
+            Add-LocalGroupMember -Group "Administrators" -Member $userName
+          }
+
+          # --- Install Tailscale if missing ---
+          if (-not (Get-Command tailscale -ErrorAction SilentlyContinue)) {
+            Write-Host "⬇️ Installing Tailscale..."
+            winget install --id Tailscale.Tailscale -e --accept-source-agreements --accept-package-agreements
+            Start-Sleep -Seconds 6
+          }
+
+          Write-Host "🔑 Logging into Tailscale..."
+          & tailscale up --auth-key="$($env:TAILSCALE_AUTHKEY)" 2>&1 | Write-Host
+
+          Start-Sleep -Seconds 5
+          $tailscaleIPs = & tailscale ip -4 2>$null
+          if (-not $tailscaleIPs) { $tailscaleIPs = & tailscale ip 2>$null }
+
+          $hostName = $env:COMPUTERNAME
+
+          Write-Host "==========================================="
+          Write-Host "📡 VM Report"
+          Write-Host "Machine name: $hostName"
+          Write-Host "VM user: $userName"
+          Write-Host "VM password: $pwdPlain"
+          Write-Host "Tailscale IP(s): $($tailscaleIPs -join ', ')"
+          Write-Host "==========================================="
+
+      - name: GPU Info
+        shell: pwsh
+        run: |
+          Write-Host "==========================================="
+          Write-Host "🎮 GPU Status (RTX 5080 Ti)"
+          try {
+            nvidia-smi
+          } catch {
+            Write-Host "Fallback via WMI:"
+            Get-WmiObject Win32_VideoController | Select-Object Name, DriverVersion
+          }
+          Write-Host "==========================================="
+
+      - name: System Resources Check
+        shell: pwsh
+        run: |
+          Write-Host "==========================================="
+          Write-Host "🖥️ System Resources"
+          # Memory check
+          $totalMem = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
+          Write-Host "Total RAM: $([math]::Round($totalMem,2)) GB"
+
+          # Disk check (C: drive size)
+          $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+          $sizeGB = [math]::Round(($disk.Size/1GB),2)
+          $freeGB = [math]::Round(($disk.FreeSpace/1GB),2)
+          Write-Host "Disk (C:): $sizeGB GB total, $freeGB GB free"
+          Write-Host "==========================================="
+          
