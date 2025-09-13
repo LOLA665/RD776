@@ -1,0 +1,77 @@
+name: Windows 11 VM Setup with GPU and Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-vm:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install PowerShell
+        run: |
+          sudo apt update
+          sudo apt install -y powershell
+
+      - name: Configure Windows VM via PowerShell Remoting
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          VM_USER_NAME: ${{ secrets.VM_USER_NAME || 'vmuser' }}
+          VM_PASSWORD: ${{ secrets.VM_PASSWORD || 'P@ssw0rd123!' }}
+          VM_HOST: ${{ secrets.VM_HOST }} # IP sau hostname al VM-ului Windows
+        run: |
+          pwsh -Command "
+          \$secpasswd = ConvertTo-SecureString '$env:VM_PASSWORD' -AsPlainText -Force
+          \$cred = New-Object System.Management.Automation.PSCredential ('$env:VM_USER_NAME', \$secpasswd)
+
+          Invoke-Command -ComputerName $env:VM_HOST -Credential \$cred -ScriptBlock {
+              param(\$TAILSCALE_AUTHKEY, \$VM_USER_NAME, \$VM_PASSWORD)
+
+              # --- User setup ---
+              try {
+                  Get-LocalUser -Name \$VM_USER_NAME -ErrorAction Stop
+                  Write-Host 'ℹ️ User already exists.'
+              } catch {
+                  Write-Host '➕ Creating user...'
+                  \$securePwd = ConvertTo-SecureString \$VM_PASSWORD -AsPlainText -Force
+                  New-LocalUser -Name \$VM_USER_NAME -Password \$securePwd -FullName \$VM_USER_NAME -PasswordNeverExpires:\$true
+                  Add-LocalGroupMember -Group 'Administrators' -Member \$VM_USER_NAME
+              }
+
+              # --- Install Tailscale ---
+              if (-not (Get-Command tailscale -ErrorAction SilentlyContinue)) {
+                  winget install --id Tailscale.Tailscale -e --accept-source-agreements --accept-package-agreements
+                  Start-Sleep -Seconds 6
+              }
+
+              Write-Host '🔑 Logging into Tailscale...'
+              tailscale up --auth-key=\$TAILSCALE_AUTHKEY 2>&1 | Write-Host
+              Start-Sleep -Seconds 5
+              \$tailscaleIPs = tailscale ip -4 2>\$null
+              if (-not \$tailscaleIPs) { \$tailscaleIPs = tailscale ip 2>\$null }
+
+              # --- GPU Info ---
+              Write-Host '🎮 GPU Status'
+              try { nvidia-smi } 
+              catch { Get-WmiObject Win32_VideoController | Select-Object Name, DriverVersion }
+
+              # --- System Resources ---
+              Write-Host '🖥️ System Resources'
+              \$totalMem = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
+              Write-Host ('Total RAM: {0} GB' -f [math]::Round(\$totalMem,2))
+              \$disk = Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID='C:'\"
+              \$sizeGB = [math]::Round((\$disk.Size/1GB),2)
+              \$freeGB = [math]::Round((\$disk.FreeSpace/1GB),2)
+              Write-Host ('Disk (C:): {0} GB total, {1} GB free' -f \$sizeGB, \$freeGB)
+
+              # --- Final Report ---
+              Write-Host '==========================================='
+              Write-Host ('📡 VM Report')
+              Write-Host ('Machine name: {0}' -f \$env:COMPUTERNAME)
+              Write-Host ('VM user: {0}' -f \$VM_USER_NAME)
+              Write-Host ('VM password: {0}' -f \$VM_PASSWORD)
+              Write-Host ('Tailscale IP(s): {0}' -f (\$tailscaleIPs -join ', '))
+              Write-Host '==========================================='
+          } -ArgumentList \$env:TAILSCALE_AUTHKEY, \$env:VM_USER_NAME, \$env:VM_PASSWORD
+          "
+          
