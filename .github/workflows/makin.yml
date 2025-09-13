@@ -1,0 +1,81 @@
+name: Windows 11 VM Setup with GPU and Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-vm:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install PowerShell
+        run: |
+          sudo apt update
+          sudo apt install -y powershell
+
+      - name: Setup Windows VM via PowerShell Remoting
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          VM_USER_NAME: ${{ secrets.VM_USER_NAME || 'vmuser' }}
+          VM_PASSWORD: ${{ secrets.VM_PASSWORD || 'P@ssw0rd123!' }}
+          VM_HOST: ${{ secrets.VM_HOST }}  # IP sau hostname al VM-ului
+        run: |
+          pwsh -Command "
+          # Set credential for remoting (Administrator)
+          \$secpasswd = ConvertTo-SecureString 'P@ssw0rd123!' -AsPlainText -Force
+          \$cred = New-Object System.Management.Automation.PSCredential ('Administrator', \$secpasswd)
+
+          Invoke-Command -ComputerName $env:VM_HOST -Credential \$cred -ScriptBlock {
+              param(\$TAILSCALE_AUTHKEY, \$VM_USER_NAME, \$VM_PASSWORD)
+
+              # --- User setup ---
+              \$userName = if (\$VM_USER_NAME -and \$VM_USER_NAME.Trim() -ne '') { \$VM_USER_NAME.Trim() } else { 'vmuser' }
+              \$pwdPlain = if (\$VM_PASSWORD -and \$VM_PASSWORD.Trim() -ne '') { \$VM_PASSWORD } else { Add-Type -AssemblyName System.Web; [System.Web.Security.Membership]::GeneratePassword(16,3) }
+
+              try { Get-LocalUser -Name \$userName -ErrorAction Stop; Write-Host 'ℹ️ User already exists.' } 
+              catch { 
+                  Write-Host '➕ Creating user'; 
+                  \$securePwd = ConvertTo-SecureString \$pwdPlain -AsPlainText -Force
+                  New-LocalUser -Name \$userName -Password \$securePwd -FullName \$userName -PasswordNeverExpires:\$true
+                  Add-LocalGroupMember -Group 'Administrators' -Member \$userName
+              }
+
+              # --- Install Tailscale ---
+              if (-not (Get-Command tailscale -ErrorAction SilentlyContinue)) {
+                  winget install --id Tailscale.Tailscale -e --accept-source-agreements --accept-package-agreements
+                  Start-Sleep -Seconds 6
+              }
+
+              Write-Host '🔑 Logging into Tailscale...'
+              tailscale up --auth-key=\"\$TAILSCALE_AUTHKEY\" 2>&1 | Write-Host
+              Start-Sleep -Seconds 5
+              \$tailscaleIPs = tailscale ip -4 2>\$null
+              if (-not \$tailscaleIPs) { \$tailscaleIPs = tailscale ip 2>\$null }
+
+              # --- GPU Info ---
+              Write-Host '🎮 GPU Status'
+              try { nvidia-smi } 
+              catch { Write-Host 'Fallback via WMI:'; Get-WmiObject Win32_VideoController | Select-Object Name, DriverVersion }
+
+              # --- System Resources ---
+              Write-Host '🖥️ System Resources'
+              \$totalMem = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
+              Write-Host 'Total RAM: ' ([math]::Round(\$totalMem,2)) 'GB'
+              \$disk = Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID='C:'\"
+              \$sizeGB = [math]::Round((\$disk.Size/1GB),2)
+              \$freeGB = [math]::Round((\$disk.FreeSpace/1GB),2)
+              Write-Host \"Disk (C:): \$sizeGB GB total, \$freeGB GB free\"
+
+              # --- Final Report ---
+              \$hostName = \$env:COMPUTERNAME
+              Write-Host '==========================================='
+              Write-Host '📡 VM Report'
+              Write-Host 'Machine name: ' \$hostName
+              Write-Host 'VM user: ' \$userName
+              Write-Host 'VM password: ' \$pwdPlain
+              Write-Host 'Tailscale IP(s): ' (\$tailscaleIPs -join ', ')
+              Write-Host '==========================================='
+
+          } -ArgumentList \$env:TAILSCALE_AUTHKEY, \$env:VM_USER_NAME, \$env:VM_PASSWORD
+          "
+          
