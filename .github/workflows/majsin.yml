@@ -1,0 +1,84 @@
+name: Random IP + Tailscale + Random User
+
+on:
+  workflow_dispatch:
+
+jobs:
+  random-info:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Update & install dependencies
+        run: |
+          sudo apt update -y
+          sudo apt install -y curl python3
+
+      - name: Install Tailscale (optional)
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscaled & sleep 3
+
+      - name: Generate random username, password & IP
+        id: gencreds
+        run: |
+          # username: ransom + 6 random alnum chars
+          RANDUSER="ransom$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c6)"
+          # password: 16 chars random
+          RANDPASS=$(tr -dc 'A-Za-z0-9!@#$%_-+=' </dev/urandom | head -c16)
+          # random IPv4 public-ish (fix for line 30)
+          RANDIP=$(python3 - <<'PY'
+import random
+while True:
+    o1 = random.randint(1,223)
+    o2 = random.randint(0,255)
+    o3 = random.randint(0,255)
+    o4 = random.randint(1,254)
+    # skip reserved/private
+    if o1==10 or o1==127: continue
+    if o1==169 and o2==254: continue
+    if o1==172 and 16<=o2<=31: continue
+    if o1==192 and o2==168: continue
+    if o1>=224: continue
+    print(f"{o1}.{o2}.{o3}.{o4}")
+    break
+PY
+)
+          # export to GitHub environment
+          echo "USERNAME=$RANDUSER" >> $GITHUB_ENV
+          echo "PASSWORD=$RANDPASS" >> $GITHUB_ENV
+          echo "RANDOM_IP=$RANDIP" >> $GITHUB_ENV
+
+      - name: Start Tailscale (if auth key provided)
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY || '' }}
+        run: |
+          if [ -n "$TAILSCALE_AUTHKEY" ]; then
+            sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --accept-routes --accept-dns=false || true
+            sleep 3
+            TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "<none>")
+            echo "TS_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+          else
+            echo "TS_IP=<no-authkey>" >> $GITHUB_ENV
+          fi
+
+      - name: GPU check
+        run: |
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "GPU_PRESENT=true" >> $GITHUB_ENV
+            nvidia-smi || true
+          else
+            echo "GPU_PRESENT=false" >> $GITHUB_ENV
+            echo "No GPU detected on runner."
+          fi
+
+      - name: Show final info
+        run: |
+          echo "==========================================="
+          echo "📡 RANDOM VM REPORT (simulated runner)"
+          echo "Random IP      : $RANDOM_IP"
+          echo "Generated user : $USERNAME"
+          echo "Generated pass : $PASSWORD"
+          echo "Tailscale IP   : ${TS_IP:-<not-set>}"
+          echo "GPU present    : ${GPU_PRESENT:-<unknown>}"
+          echo "==========================================="
+          
